@@ -1,7 +1,10 @@
-use anchor_lang::prelude::*;
-use anchor_spl::token::{self, Mint, Token, TokenAccount};
 
-declare_id!("BMY8YvAftXsm6EXDa7FVkny41dDLrMMXzLKagjCaZxq6");
+#![allow(unexpected_cfgs)]
+#![allow(deprecated)]
+use anchor_lang::prelude::*;
+use anchor_spl::token::{self, Token, TokenAccount};
+
+declare_id!("294BsSNNf6Nt5T7xQZWSSQ5nAcPhcmkdtgkuUj2woCox");
 
 #[program]
 pub mod solana_streaming_payments {
@@ -15,14 +18,17 @@ pub mod solana_streaming_payments {
         fee_percentage: u8,
     ) -> Result<()> {
         let stream = &mut ctx.accounts.stream;
-        stream.payer = *ctx.accounts.payer.key;
-        stream.payee = *ctx.accounts.payee.key;
+        let bump = ctx.bumps.stream;
+        
+        stream.payer = ctx.accounts.payer.key();
+        stream.payee = ctx.accounts.payee.key();
         stream.amount = amount;
         stream.rate_per_minute = rate_per_minute;
         stream.start_time = Clock::get()?.unix_timestamp;
         stream.duration_minutes = duration_minutes;
         stream.fee_percentage = fee_percentage;
         stream.redeemed = 0;
+        stream.bump = bump;
 
         // Transfer funds to escrow
         let cpi_accounts = token::Transfer {
@@ -56,18 +62,24 @@ pub mod solana_streaming_payments {
         let cpi_accounts = token::Transfer {
             from: ctx.accounts.escrow_token.to_account_info(),
             to: ctx.accounts.payee_token.to_account_info(),
-            authority: ctx.accounts.stream.to_account_info(),
+            authority: ctx.accounts.payer.to_account_info(),
         };
-        token::transfer(CpiContext::new(cpi_program.clone(), cpi_accounts), amount_to_payee)?;
+        token::transfer(
+            CpiContext::new(cpi_program.clone(), cpi_accounts), 
+            amount_to_payee
+        )?;
 
         // Transfer fee (if any)
         if fee > 0 {
             let cpi_accounts = token::Transfer {
                 from: ctx.accounts.escrow_token.to_account_info(),
                 to: ctx.accounts.fee_account.to_account_info(),
-                authority: ctx.accounts.stream.to_account_info(),
+                authority: ctx.accounts.payer.to_account_info(),
             };
-            token::transfer(CpiContext::new(cpi_program, cpi_accounts), fee)?;
+            token::transfer(
+                CpiContext::new(cpi_program, cpi_accounts), 
+                fee
+            )?;
         }
 
         // Mutable borrow only for updating the account
@@ -77,7 +89,7 @@ pub mod solana_streaming_payments {
     }
 
     pub fn reclaim_stream(ctx: Context<ReclaimStream>, _seed: u64) -> Result<()> {
-        let stream = &mut ctx.accounts.stream;
+        let stream = &ctx.accounts.stream;
         let current_time = Clock::get()?.unix_timestamp;
         let elapsed_minutes = (current_time - stream.start_time) as u64 / 60;
 
@@ -91,15 +103,11 @@ pub mod solana_streaming_payments {
             return Err(ErrorCode::NoFundsToReclaim.into());
         }
 
-        // Transfer remaining funds back to payer
-        let cpi_accounts = token::Transfer {
-            from: ctx.accounts.escrow_token.to_account_info(),
-            to: ctx.accounts.payer_token.to_account_info(),
-            authority: ctx.accounts.stream.to_account_info(),
-        };
-        let cpi_program = ctx.accounts.token_program.to_account_info();
-        token::transfer(CpiContext::new(cpi_program, cpi_accounts), remaining_amount)?;
-
+        // No need to transfer - the payer already owns the escrow account
+        // Just update the stream account to mark it as fully redeemed
+        let stream = &mut ctx.accounts.stream;
+        stream.redeemed = stream.amount;
+        
         Ok(())
     }
 }
@@ -110,18 +118,30 @@ pub struct CreateStream<'info> {
     #[account(
         init,
         payer = payer,
-        space = 8 + 32 + 32 + 8 + 8 + 8 + 8 + 1,
+        space = 8 + 32 + 32 + 8 + 8 + 8 + 8 + 1 + 8 + 1, // Space for Stream account
         seeds = [b"stream", payer.key().as_ref(), payee.key().as_ref()],
         bump
     )]
     pub stream: Account<'info, Stream>,
+    
     #[account(mut)]
     pub payer: Signer<'info>,
+    
+    /// CHECK: This is just a public key for the payee
     pub payee: AccountInfo<'info>,
-    #[account(mut)]
+    
+    #[account(
+        mut,
+        constraint = payer_token.owner == payer.key()
+    )]
     pub payer_token: Account<'info, TokenAccount>,
-    #[account(mut)]
+    
+    #[account(
+        mut,
+        constraint = escrow_token.owner == payer.key()
+    )]
     pub escrow_token: Account<'info, TokenAccount>,
+    
     pub token_program: Program<'info, Token>,
     pub system_program: Program<'info, System>,
     pub rent: Sysvar<'info, Rent>,
@@ -134,18 +154,31 @@ pub struct RedeemStream<'info> {
         mut,
         has_one = payee,
         seeds = [b"stream", payer.key().as_ref(), payee.key().as_ref()],
-        bump
+        bump = stream.bump
     )]
     pub stream: Account<'info, Stream>,
-    pub payer: AccountInfo<'info>,
+    
+    #[account(mut)]
+    pub payer: Signer<'info>,
+    
     #[account(mut)]
     pub payee: Signer<'info>,
-    #[account(mut)]
+    
+    #[account(
+        mut,
+        constraint = payee_token.owner == payee.key()
+    )]
     pub payee_token: Account<'info, TokenAccount>,
-    #[account(mut)]
+    
+    #[account(
+        mut,
+        constraint = escrow_token.owner == payer.key()
+    )]
     pub escrow_token: Account<'info, TokenAccount>,
+    
     #[account(mut)]
     pub fee_account: Account<'info, TokenAccount>,
+    
     pub token_program: Program<'info, Token>,
 }
 
@@ -156,16 +189,22 @@ pub struct ReclaimStream<'info> {
         mut,
         has_one = payer,
         seeds = [b"stream", payer.key().as_ref(), payee.key().as_ref()],
-        bump
+        bump = stream.bump
     )]
     pub stream: Account<'info, Stream>,
+    
     #[account(mut)]
     pub payer: Signer<'info>,
+    
+    /// CHECK: This is just a public key for the payee
     pub payee: AccountInfo<'info>,
-    #[account(mut)]
-    pub payer_token: Account<'info, TokenAccount>,
-    #[account(mut)]
+    
+    #[account(
+        mut,
+        constraint = escrow_token.owner == payer.key()
+    )]
     pub escrow_token: Account<'info, TokenAccount>,
+    
     pub token_program: Program<'info, Token>,
 }
 
@@ -179,6 +218,7 @@ pub struct Stream {
     pub duration_minutes: u64,
     pub fee_percentage: u8,
     pub redeemed: u64,
+    pub bump: u8,
 }
 
 #[error_code]
