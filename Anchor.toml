@@ -15,8 +15,8 @@ contract = "BMY8YvAftXsm6EXDa7FVkny41dDLrMMXzLKagjCaZxq6"
 url = "https://api.apr.dev"
 
 [provider]
-cluster = "devnet"
-wallet = "~/my-solana-wallet.json"
+cluster = "localnet"
+wallet = "~/.config/solana/id.json"
 
 [scripts]
 test = "yarn run ts-mocha -p ./tsconfig.json -t 1000000 tests/**/*.ts"

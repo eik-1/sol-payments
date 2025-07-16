@@ -8,10 +8,12 @@ edition = "2021"
 crate-type = ["cdylib", "lib"]
 name = "solana_streaming_payments"
 
-[dependencies]
-anchor-lang = "0.31.1"
-anchor-spl = "0.31.1" 
+[dependencies] 
+anchor-lang = {version = "0.31.1", features = ["init-if-needed"] }
+anchor-spl = { version = "0.31.1", features = ["metadata"] } 
+
 
 [features]
 anchor-debug = []
+idl-build = ["anchor-lang/idl-build", "anchor-spl/idl-build"]
 
