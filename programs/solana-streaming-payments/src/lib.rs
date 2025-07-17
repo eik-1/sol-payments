@@ -4,7 +4,7 @@
 use anchor_lang::prelude::*;
 use anchor_spl::token::{self, Mint, Token, TokenAccount, Transfer};
 
-declare_id!("294BsSNNf6Nt5T7xQZWSSQ5nAcPhcmkdtgkuUj2woCox");
+declare_id!("RMTdcrr5L5M32zBy86nQRghzfcBWVLQZ5AzFwiwsL62");
 
 #[program]
 pub mod solana_streaming_payments {
@@ -244,7 +244,6 @@ pub struct CreateStream<'info> {
 }
 
 #[derive(Accounts)]
-#[instruction(seed: u64)]
 pub struct RedeemStream<'info> {
     #[account(mut)]
     pub payee: Signer<'info>,
@@ -323,33 +322,6 @@ pub struct CancelStream<'info> {
     
     pub token_program: Program<'info, Token>,
 }
-
-
-// #[derive(Accounts)]
-// #[instruction(seed: u64)]
-// pub struct CheckStream<'info> {
-//     #[account(
-//         mut,
-//         has_one = payer,
-//         seeds = [b"stream", payer.key().as_ref(), payee.key().as_ref()],
-//         bump = stream.bump
-//     )]
-//     pub stream: Account<'info, Stream>,
-    
-//     #[account(mut)]
-//     pub payer: Signer<'info>,
-    
-//     /// CHECK: This is just a public key for the payee
-//     pub payee: AccountInfo<'info>,
-    
-//     #[account(
-//         mut,
-//         constraint = escrow_token.owner == payer.key()
-//     )]
-//     pub escrow_token: Account<'info, TokenAccount>,
-    
-//     pub token_program: Program<'info, Token>,
-// }
 
 #[account]
 #[derive(InitSpace)]
