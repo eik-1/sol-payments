@@ -65,7 +65,7 @@ npm install -g yarn
 ### 1. Clone and Setup
 
 ```bash
-git clone <repository-url>
+git clone https://github.com/eik-1/sol-payments
 cd solana-streaming-payments
 yarn install
 ```
