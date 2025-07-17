@@ -40,6 +40,7 @@ pub mod solana_streaming_payments {
         stream.redeemed = 0;
         stream.stream_bump = ctx.bumps.stream;
         stream.escrow_bump = ctx.bumps.escrow_token;
+        stream.escrow_authority_bump = ctx.bumps.escrow_authority;
 
         // Transfer funds to escrow
         token::transfer(
@@ -75,10 +76,10 @@ pub mod solana_streaming_payments {
         let payer_key = stream.payer.key();
         let payee_key = stream.payee.key();
         let seeds = &[
-            b"escrow",
+            b"escrow_authority",
             payer_key.as_ref(),
             payee_key.as_ref(),
-            &[stream.escrow_bump],
+            &[stream.escrow_authority_bump],
         ];
         let signer = &[&seeds[..]];
 
@@ -90,7 +91,7 @@ pub mod solana_streaming_payments {
                     Transfer {
                         from: ctx.accounts.escrow_token.to_account_info(),
                         to: ctx.accounts.payee_token.to_account_info(),
-                        authority: ctx.accounts.escrow_token.to_account_info(),
+                        authority: ctx.accounts.escrow_authority.to_account_info(),
                     },
                     signer,
                 ),
@@ -106,7 +107,7 @@ pub mod solana_streaming_payments {
                     Transfer {
                         from: ctx.accounts.escrow_token.to_account_info(),
                         to: ctx.accounts.fee_account.to_account_info(),
-                        authority: ctx.accounts.escrow_token.to_account_info(),
+                        authority: ctx.accounts.escrow_authority.to_account_info(),
                     },
                     signer,
                 ),
@@ -123,27 +124,31 @@ pub mod solana_streaming_payments {
     pub fn cancel_stream(ctx: Context<CancelStream>) -> Result<()> {
         let stream = &ctx.accounts.stream;
 
-        // First, redeem any outstanding balance to the payee
+        // First, calculate any outstanding balance to the payee
         let current_time = Clock::get()?.unix_timestamp;
         let elapsed_minutes = (current_time - stream.start_time) as u64 / 60;
         let total_streamable_minutes = stream.duration_minutes.min(elapsed_minutes);
         let redeemable_amount = total_streamable_minutes * stream.rate_per_minute;
-        let amount_to_payee = redeemable_amount.saturating_sub(stream.redeemed);
+        let amount_to_payee_and_fee = redeemable_amount.saturating_sub(stream.redeemed);
 
         // Define the PDA seeds for signing
         let payer_key = stream.payer.key();
         let payee_key = stream.payee.key();
         let seeds = &[
-            b"escrow",
+            b"escrow_authority",
             payer_key.as_ref(),
             payee_key.as_ref(),
-            &[stream.escrow_bump],
+            &[stream.escrow_authority_bump],
         ];
         let signer = &[&seeds[..]];
 
-        if amount_to_payee > 0 {
-            let fee = (amount_to_payee * stream.fee_percentage as u64) / 100;
-            let net_to_payee = amount_to_payee - fee;
+        msg!("escrow_token authority: {}", ctx.accounts.escrow_token.owner);
+        msg!("escrow_authority: {}", ctx.accounts.escrow_authority.key());
+
+
+        if amount_to_payee_and_fee > 0 {
+            let fee = (amount_to_payee_and_fee * stream.fee_percentage as u64) / 100;
+            let net_to_payee = amount_to_payee_and_fee - fee;
 
             // Pay net amount to payee
             if net_to_payee > 0 {
@@ -153,7 +158,7 @@ pub mod solana_streaming_payments {
                         Transfer {
                             from: ctx.accounts.escrow_token.to_account_info(),
                             to: ctx.accounts.payee_token.to_account_info(),
-                            authority: ctx.accounts.escrow_token.to_account_info(),
+                            authority: ctx.accounts.escrow_authority.to_account_info(),
                         },
                         signer,
                     ),
@@ -168,7 +173,7 @@ pub mod solana_streaming_payments {
                         Transfer {
                             from: ctx.accounts.escrow_token.to_account_info(),
                             to: ctx.accounts.fee_account.to_account_info(),
-                            authority: ctx.accounts.escrow_token.to_account_info(),
+                            authority: ctx.accounts.escrow_authority.to_account_info(),
                         },
                         signer,
                     ),
@@ -179,7 +184,8 @@ pub mod solana_streaming_payments {
 
 
         // Refund the remaining balance to the payer
-        let remaining_amount = ctx.accounts.escrow_token.amount - amount_to_payee;
+        ctx.accounts.escrow_token.reload()?;
+        let remaining_amount = ctx.accounts.escrow_token.amount;
         if remaining_amount > 0 {
             token::transfer(
                 CpiContext::new_with_signer(
@@ -187,7 +193,7 @@ pub mod solana_streaming_payments {
                     Transfer {
                         from: ctx.accounts.escrow_token.to_account_info(),
                         to: ctx.accounts.payer_token.to_account_info(),
-                        authority: ctx.accounts.escrow_token.to_account_info(),
+                        authority: ctx.accounts.escrow_authority.to_account_info(),
                     },
                     signer,
                 ),
@@ -195,8 +201,17 @@ pub mod solana_streaming_payments {
             )?;
         }
         
-        // The `close` directive on the stream and escrow accounts will automatically
-        // trigger closing them and refunding the rent to the payer.
+        token::close_account(
+        CpiContext::new_with_signer(
+            ctx.accounts.token_program.to_account_info(),
+            token::CloseAccount {
+                account: ctx.accounts.escrow_token.to_account_info(),
+                destination: ctx.accounts.payer.to_account_info(), // Rent refund goes here
+                authority: ctx.accounts.escrow_authority.to_account_info(),
+            },
+            signer, // Use the same signer array as your transfers
+        ),
+    )?;
 
         Ok(())
     }
@@ -213,6 +228,13 @@ pub struct CreateStream<'info> {
         bump
     )]
     pub stream: Account<'info, Stream>,
+
+    #[account(
+        seeds = [b"escrow_authority", payer.key().as_ref(), payee.key().as_ref()],
+        bump
+    )]
+    /// CHECK: PDA for token authority
+    pub escrow_authority: UncheckedAccount<'info>,
     
     #[account(mut)]
     pub payer: Signer<'info>,
@@ -233,7 +255,7 @@ pub struct CreateStream<'info> {
         init,
         payer = payer,
         token::mint = mint,
-        token::authority = escrow_token,
+        token::authority = escrow_authority,
         seeds = [b"escrow", payer.key().as_ref(), payee.key().as_ref()],
         bump
     )]
@@ -256,12 +278,20 @@ pub struct RedeemStream<'info> {
         bump = stream.stream_bump
     )]
     pub stream: Account<'info, Stream>,
+
+    #[account(
+        seeds = [b"escrow_authority", payer.key().as_ref(), payee.key().as_ref()],
+        bump
+    )]
+    /// CHECK: PDA for token authority
+    pub escrow_authority: UncheckedAccount<'info>,
     
     /// CHECK: Payer account from the stream state is used for seed derivation.
     pub payer: AccountInfo<'info>,
 
     #[account(
         mut,
+        token::authority = escrow_authority,
         seeds = [b"escrow", stream.payer.as_ref(), stream.payee.as_ref()],
         bump = stream.escrow_bump
     )]
@@ -296,15 +326,22 @@ pub struct CancelStream<'info> {
         has_one = payee,
         seeds = [b"stream", payer.key().as_ref(), payee.key().as_ref()],
         bump = stream.stream_bump,
-        close = payer
     )]
     pub stream: Account<'info, Stream>,
 
     #[account(
+        seeds = [b"escrow_authority", payer.key().as_ref(), payee.key().as_ref()],
+        bump
+    )]
+    /// CHECK: PDA for token authority
+    pub escrow_authority: UncheckedAccount<'info>,
+
+    #[account(
         mut,
+        token::authority = escrow_authority,
         seeds = [b"escrow", stream.payer.as_ref(), stream.payee.as_ref()],
         bump = stream.escrow_bump,
-        close = payer
+        // close = payer
     )]
     pub escrow_token: Account<'info, TokenAccount>,
 
@@ -337,6 +374,7 @@ pub struct Stream {
     pub redeemed: u64,
     pub stream_bump: u8,
     pub escrow_bump: u8,
+    pub escrow_authority_bump: u8,
 }
 
 #[error_code]

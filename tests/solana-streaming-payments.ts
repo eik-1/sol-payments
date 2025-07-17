@@ -4,11 +4,11 @@ import * as anchor from "@coral-xyz/anchor";
 import { Program } from "@coral-xyz/anchor";
 import { SolanaStreamingPayments } from "../target/types/solana_streaming_payments";
 import { PublicKey, SystemProgram, LAMPORTS_PER_SOL, Keypair } from "@solana/web3.js";
-import { 
-  TOKEN_PROGRAM_ID, 
-  createMint, 
-  mintTo, 
-  getAccount, 
+import {
+  TOKEN_PROGRAM_ID,
+  createMint,
+  mintTo,
+  getAccount,
   createAssociatedTokenAccount,
   getOrCreateAssociatedTokenAccount
 } from "@solana/spl-token";
@@ -18,7 +18,7 @@ describe("solana-streaming-payments", () => {
   const provider = anchor.AnchorProvider.env();
   anchor.setProvider(provider);
   const program = anchor.workspace.SolanaStreamingPayments as Program<SolanaStreamingPayments>;
-  
+
   // Keypairs and addresses
   let mint: PublicKey;
   const payer = provider.wallet.publicKey;
@@ -33,6 +33,7 @@ describe("solana-streaming-payments", () => {
   // PDAs
   let streamPda: PublicKey;
   let escrowPda: PublicKey;
+  let escrowAuthority: PublicKey;
 
   before(async () => {
     // --- Setup Wallets ---
@@ -48,7 +49,7 @@ describe("solana-streaming-payments", () => {
       { signature: sig2, ...(await provider.connection.getLatestBlockhash()) },
       "confirmed"
     );
-    
+
     // --- Setup Tokens ---
     // Create a new token mint
     mint = await createMint(
@@ -58,7 +59,7 @@ describe("solana-streaming-payments", () => {
       null, // Freeze authority
       9 // Decimals
     );
-    
+
     // Create associated token accounts for each wallet
     payerToken = (
       await getOrCreateAssociatedTokenAccount(
@@ -105,6 +106,11 @@ describe("solana-streaming-payments", () => {
       [Buffer.from("escrow"), payer.toBuffer(), payee.publicKey.toBuffer()],
       program.programId
     );
+
+    [escrowAuthority] = PublicKey.findProgramAddressSync(
+      [Buffer.from("escrow_authority"), payer.toBuffer(), payee.publicKey.toBuffer()],
+      program.programId
+    );
   });
 
   it("Creates a stream", async () => {
@@ -118,6 +124,7 @@ describe("solana-streaming-payments", () => {
       .accounts({
         stream: streamPda,
         escrowToken: escrowPda,
+        escrowAuthority: escrowAuthority,
         payer: payer,
         payee: payee.publicKey,
         mint: mint,
@@ -161,6 +168,7 @@ describe("solana-streaming-payments", () => {
       .accounts({
         stream: streamPda,
         escrowToken: escrowPda,
+        escrowAuthority: escrowAuthority,
         payee: payee.publicKey,
         payer: payer, // Payer pubkey is still needed for seed derivation
         payeeToken: payeeToken,
@@ -199,4 +207,202 @@ describe("solana-streaming-payments", () => {
       "Stream redeemed amount was not updated correctly"
     );
   });
+
+  it("Cancels a stream as the payer", async () => {
+    // --- Setup a new stream just for this test ---
+    const cancelPayee = Keypair.generate();
+    await provider.connection.confirmTransaction(
+      await provider.connection.requestAirdrop(cancelPayee.publicKey, 1 * LAMPORTS_PER_SOL)
+    );
+    const cancelPayeeToken = await createAssociatedTokenAccount(provider.connection, provider.wallet.payer, mint, cancelPayee.publicKey);
+
+    const [cancelStreamPda] = PublicKey.findProgramAddressSync(
+      [Buffer.from("stream"), payer.toBuffer(), cancelPayee.publicKey.toBuffer()],
+      program.programId
+    );
+    const [cancelEscrowPda] = PublicKey.findProgramAddressSync(
+      [Buffer.from("escrow"), payer.toBuffer(), cancelPayee.publicKey.toBuffer()],
+      program.programId
+    );
+
+    const [cancelEscrowAuthority] = PublicKey.findProgramAddressSync(
+      [Buffer.from("escrow_authority"), payer.toBuffer(), cancelPayee.publicKey.toBuffer()],
+      program.programId
+    );
+
+    const streamAmount = new anchor.BN(5 * LAMPORTS_PER_SOL);
+    const ratePerMinute = new anchor.BN(1 * LAMPORTS_PER_SOL);
+    const durationMinutes = new anchor.BN(5);
+    const feePercentage = 10; // 10%
+
+    // Create the stream
+    await program.methods
+      .createStream(streamAmount, ratePerMinute, durationMinutes, feePercentage)
+      .accounts({
+        stream: cancelStreamPda,
+        escrowToken: cancelEscrowPda,
+        escrowAuthority: cancelEscrowAuthority,
+        payer,
+        payee: cancelPayee.publicKey,
+        mint,
+        payerToken,
+        tokenProgram: TOKEN_PROGRAM_ID,
+        systemProgram: SystemProgram.programId,
+      })
+      .rpc();
+
+    // Wait for 30 seconds so some funds have vested
+    console.log("Waiting for 30 seconds before cancelling...");
+    await new Promise(resolve => setTimeout(resolve, 30000));
+
+    const payerTokenBefore = await getAccount(provider.connection, payerToken);
+
+    // --- Cancel the Stream ---
+    await program.methods
+      .cancelStream()
+      .accounts({
+        payer,
+        payee: cancelPayee.publicKey,
+        stream: cancelStreamPda,
+        escrowToken: cancelEscrowPda,
+        escrowAuthority: cancelEscrowAuthority,
+        payerToken,
+        payeeToken: cancelPayeeToken,
+        feeAccount,
+        tokenProgram: TOKEN_PROGRAM_ID,
+      })
+      .rpc();
+
+    // --- Verification ---
+
+    // Verify token balances
+    const payerTokenAfter = await getAccount(provider.connection, payerToken);
+    const cancelPayeeTokenAfter = await getAccount(provider.connection, cancelPayeeToken);
+
+    // Expected amounts (for 0 minutes, since we waited < 60s)
+    const vestedAmount = new anchor.BN(0);
+    const refundToPayer = streamAmount.sub(vestedAmount);
+
+    assert.equal(
+      payerTokenAfter.amount.toString(),
+      (BigInt(payerTokenBefore.amount.toString()) + BigInt(refundToPayer.toString())).toString(),
+      "Payer did not receive the correct refund"
+    );
+    assert.equal(
+      cancelPayeeTokenAfter.amount.toString(),
+      vestedAmount.toString(),
+      "Payee should have received nothing"
+    );
+
+    console.log(`Cancellation successful. Payer was refunded ${refundToPayer}.`);
+  });
+
+  it("Cancels a stream as the payer after 70 seconds (some vested)", async () => {
+    // --- Setup a new stream just for this test ---
+    const cancelPayee = Keypair.generate();
+    await provider.connection.confirmTransaction(
+      await provider.connection.requestAirdrop(cancelPayee.publicKey, 1 * LAMPORTS_PER_SOL)
+    );
+    const cancelPayeeToken = await createAssociatedTokenAccount(
+      provider.connection, provider.wallet.payer, mint, cancelPayee.publicKey
+    );
+
+    const [cancelStreamPda] = PublicKey.findProgramAddressSync(
+      [Buffer.from("stream"), payer.toBuffer(), cancelPayee.publicKey.toBuffer()],
+      program.programId
+    );
+    const [cancelEscrowPda] = PublicKey.findProgramAddressSync(
+      [Buffer.from("escrow"), payer.toBuffer(), cancelPayee.publicKey.toBuffer()],
+      program.programId
+    );
+    const [cancelEscrowAuthority] = PublicKey.findProgramAddressSync(
+      [Buffer.from("escrow_authority"), payer.toBuffer(), cancelPayee.publicKey.toBuffer()],
+      program.programId
+    );
+
+    const streamAmount = new anchor.BN(5 * LAMPORTS_PER_SOL);
+    const ratePerMinute = new anchor.BN(1 * LAMPORTS_PER_SOL);
+    const durationMinutes = new anchor.BN(5);
+    const feePercentage = 10; // 10%
+
+    // Create the stream
+    await program.methods
+      .createStream(streamAmount, ratePerMinute, durationMinutes, feePercentage)
+      .accounts({
+        stream: cancelStreamPda,
+        escrowToken: cancelEscrowPda,
+        escrowAuthority: cancelEscrowAuthority,
+        payer,
+        payee: cancelPayee.publicKey,
+        mint,
+        payerToken,
+        tokenProgram: TOKEN_PROGRAM_ID,
+        systemProgram: SystemProgram.programId,
+      })
+      .rpc();
+
+    // Wait for 70 seconds (>60s, so one minute vests)
+    console.log("Waiting for 70 seconds before cancelling...");
+    await new Promise(resolve => setTimeout(resolve, 70000));
+
+    const payerTokenBefore = await getAccount(provider.connection, payerToken);
+    const cancelPayeeTokenBefore = await getAccount(provider.connection, cancelPayeeToken);
+    const feeTokenBefore = await getAccount(provider.connection, feeAccount);
+
+    // --- Cancel the Stream ---
+    await program.methods
+      .cancelStream()
+      .accounts({
+        payer,
+        payee: cancelPayee.publicKey,
+        stream: cancelStreamPda,
+        escrowToken: cancelEscrowPda,
+        escrowAuthority: cancelEscrowAuthority,
+        payerToken,
+        payeeToken: cancelPayeeToken,
+        feeAccount,
+        tokenProgram: TOKEN_PROGRAM_ID,
+      })
+      .rpc();
+
+    // --- Verification ---
+
+    // After 1 minute, 1*LAMPORTS_PER_SOL vests, 10% fee goes to feeAccount, 90% to payee
+    const oneMinute = new anchor.BN(1 * LAMPORTS_PER_SOL);
+    const vestedAmount = oneMinute;
+    const feeAmount = vestedAmount.muln(10).divn(100); // 10%
+    const payeeAmount = vestedAmount.sub(feeAmount);
+    const refundToPayer = streamAmount.sub(vestedAmount);
+
+    // Refresh balances
+    const payerTokenAfter = await getAccount(provider.connection, payerToken);
+    const cancelPayeeTokenAfter = await getAccount(provider.connection, cancelPayeeToken);
+    const feeTokenAfter = await getAccount(provider.connection, feeAccount);
+
+    // Payer: gets refunded the remaining
+    assert.equal(
+      payerTokenAfter.amount.toString(),
+      (BigInt(payerTokenBefore.amount.toString()) + BigInt(refundToPayer.toString())).toString(),
+      "Payer did not receive the correct refund after 1 min vested"
+    );
+
+    // Payee: gets their vested amount minus fee
+    assert.equal(
+      (BigInt(cancelPayeeTokenAfter.amount.toString()) - BigInt(cancelPayeeTokenBefore.amount.toString())).toString(),
+      payeeAmount.toString(),
+      "Payee did not receive correct vested tokens after 1 min"
+    );
+
+    // Fee account: gets the fee
+    assert.equal(
+      (BigInt(feeTokenAfter.amount.toString()) - BigInt(feeTokenBefore.amount.toString())).toString(),
+      feeAmount.toString(),
+      "Fee account did not receive the correct amount after 1 min"
+    );
+
+    console.log(
+      `Cancellation (after 1 min) successful. Payee got ${payeeAmount}, fee account got ${feeAmount}, payer refunded ${refundToPayer}.`
+    );
+  });
+
 });
