@@ -7,7 +7,6 @@ import BN from "bn.js";
 import { Transaction, TransactionInstruction } from "@solana/web3.js";
 import { getAssociatedTokenAddress } from "@solana/spl-token";
 import { TOKEN_PROGRAM_ID } from "@solana/spl-token";
-import { sendTransaction } from "@solana/wallet-adapter-base";
 
 const USDC_MINT = new PublicKey("4zMMC9srt5Ri5X14GAgXhaHii3GnPAEERYPJgZJDncDU");
 const PROGRAM_ID = new PublicKey("RMTdcrr5L5M32zBy86nQRghzfcBWVLQZ5AzFwiwsL62");
@@ -47,7 +46,7 @@ function CopyButton({ value }: { value: string }) {
 }
 
 export default function StreamInfo() {
-  const { publicKey } = useWallet();
+  const { publicKey, sendTransaction } = useWallet();
   const { connection } = useConnection();
   const [payeeInput, setPayeeInput] = useState("");
   const [streams, setStreams] = useState<any[]>([]);

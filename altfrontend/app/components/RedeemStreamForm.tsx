@@ -49,34 +49,53 @@ export default function RedeemStreamForm() {
     setLoading(true);
     try {
       const streamPubkey = new PublicKey(streamId.trim());
-      // Fetch stream account data to get payer/payee (optional, if you want to show info)
-      // For now, assume payer/payee are known or can be derived
+      // Fetch stream account data
+      const acc = await connection.getAccountInfo(streamPubkey);
+      if (!acc || acc.data.length === 0) {
+        setMessage("Stream account not found.");
+        setLoading(false);
+        return;
+      }
+      // Decode stream account (layout from IDL)
+      const payer = new PublicKey(acc.data.slice(8, 40));
+      const payee = new PublicKey(acc.data.slice(40, 72));
       // Derive PDAs
-      // You may need to fetch the stream account to get payer/payee for correct PDA derivation
-      // For this example, we'll assume the user is the payee and knows the payer
-      // In production, fetch the stream account data to get payer/payee
-      // For now, just use the streamPubkey as the stream account
+      const [escrowAuthorityPda] = await PublicKey.findProgramAddress(
+        [Buffer.from("escrow_authority"), payer.toBuffer(), payee.toBuffer()],
+        PROGRAM_ID
+      );
+      const [escrowTokenPda] = await PublicKey.findProgramAddress(
+        [Buffer.from("escrow"), payer.toBuffer(), payee.toBuffer()],
+        PROGRAM_ID
+      );
+      // Associated token accounts
+      const payeeToken = await getAssociatedTokenAddress(USDC_MINT, payee);
+      // Fee account (for now, use payer's token account as placeholder)
+      const feeAccount = await getAssociatedTokenAddress(USDC_MINT, payer);
       // Build instruction data
-      const discriminator = Buffer.from([59,108,27,226,102,21,125,225]); // from IDL
-      // redeem_stream takes no args, so only discriminator
+      const discriminator = Buffer.from([59,108,27,226,102,21,125,225]);
       const data = discriminator;
-      // You must provide all required accounts in the correct order
-      // This is a placeholder; you must fill in the correct accounts for your program
-      // For now, just show an error if not implemented
-      setMessage("Manual redeem_stream not fully implemented. You must fetch the stream account and provide all required accounts.");
-      setLoading(false);
-      return;
-      // Example (not complete):
-      // const keys = [ ... ];
-      // const ix = new TransactionInstruction({
-      //   programId: PROGRAM_ID,
-      //   keys,
-      //   data,
-      // });
-      // const tx = new Transaction().add(ix);
-      // const sig = await sendTransaction(tx, connection);
-      // await connection.confirmTransaction(sig, "confirmed");
-      // setMessage("Redeemed successfully! Tx: " + sig);
+      // Build accounts array in the exact order as the Anchor IDL
+      const keys = [
+        { pubkey: payee, isSigner: true, isWritable: true },
+        { pubkey: streamPubkey, isSigner: false, isWritable: true },
+        { pubkey: escrowAuthorityPda, isSigner: false, isWritable: false },
+        { pubkey: payer, isSigner: false, isWritable: false },
+        { pubkey: escrowTokenPda, isSigner: false, isWritable: true },
+        { pubkey: payeeToken, isSigner: false, isWritable: true },
+        { pubkey: feeAccount, isSigner: false, isWritable: true },
+        { pubkey: TOKEN_PROGRAM_ID, isSigner: false, isWritable: false },
+      ];
+      // Create and send transaction
+      const ix = new TransactionInstruction({
+        programId: PROGRAM_ID,
+        keys,
+        data,
+      });
+      const tx = new Transaction().add(ix);
+      const sig = await sendTransaction(tx, connection);
+      await connection.confirmTransaction(sig, "confirmed");
+      setMessage("Redeemed successfully! Tx: " + sig);
     } catch (err: any) {
       setMessage("Error: " + (err.message || err.toString()));
     } finally {
